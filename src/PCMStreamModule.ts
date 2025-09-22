@@ -1,12 +1,12 @@
 import { NativeModule, requireNativeModule } from 'expo';
 
-import { PCMStreamModuleEvents } from './PCMStream.types';
+import { PCMStreamModuleEvents, PCMStreamModuleSpec } from './PCMStream.types';
 
-declare class PCMStreamModule extends NativeModule<PCMStreamModuleEvents> {
-  PI: number;
+declare class PCMStreamModule extends NativeModule<PCMStreamModuleEvents> implements PCMStreamModuleSpec {
   hello(): string;
-  setValueAsync(value: string): Promise<void>;
+  initPlayer(sampleRate?: number): void;
+  playPCMChunk(chunk: Uint8Array): void;
+  stopPlayback(): void;
 }
 
-// This call loads the native module object from the JSI.
 export default requireNativeModule<PCMStreamModule>('PCMStream');

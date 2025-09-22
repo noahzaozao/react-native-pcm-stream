@@ -4,16 +4,27 @@ export type OnLoadEventPayload = {
   url: string;
 };
 
-export type PCMStreamModuleEvents = {
-  onChange: (params: ChangeEventPayload) => void;
+export type OnErrorEventPayload = {
+  message?: string | null;
 };
 
-export type ChangeEventPayload = {
-  value: string;
+export type PCMStreamModuleEvents = {
+  onError?: (params: OnErrorEventPayload) => void;
+  onPlaybackStart?: () => void;
+  onPlaybackStop?: () => void;
 };
 
 export type PCMStreamViewProps = {
   url: string;
-  onLoad: (event: { nativeEvent: OnLoadEventPayload }) => void;
+  onLoad?: (event: { nativeEvent: OnLoadEventPayload }) => void;
   style?: StyleProp<ViewStyle>;
+};
+
+// 已移除 View，用模块方法替代
+
+export type PCMStreamModuleSpec = {
+  hello: () => string;
+  initPlayer: (sampleRate?: number) => void;
+  playPCMChunk: (chunk: Uint8Array) => void;
+  stopPlayback: () => void;
 };

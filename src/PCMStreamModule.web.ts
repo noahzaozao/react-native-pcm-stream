@@ -1,15 +1,14 @@
 import { registerWebModule, NativeModule } from 'expo';
 
-import { PCMStreamModuleEvents } from './PCMStream.types';
+import { PCMStreamModuleEvents, PCMStreamModuleSpec } from './PCMStream.types';
 
-class PCMStreamModule extends NativeModule<PCMStreamModuleEvents> {
-  PI = Math.PI;
-  async setValueAsync(value: string): Promise<void> {
-    this.emit('onChange', { value });
-  }
+class PCMStreamModule extends NativeModule<PCMStreamModuleEvents> implements PCMStreamModuleSpec {
   hello() {
-    return 'Hello world! 👋';
+    return 'Hello from PCMStream (web mock)';
   }
+  initPlayer(_sampleRate?: number) {}
+  playPCMChunk(_chunk: Uint8Array) {}
+  stopPlayback() {}
 }
 
-export default registerWebModule(PCMStreamModule, 'PCMStreamModule');
+export default registerWebModule(PCMStreamModule, 'PCMStream');
