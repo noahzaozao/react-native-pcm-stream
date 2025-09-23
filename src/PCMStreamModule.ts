@@ -6,7 +6,12 @@ declare class PCMStreamModule extends NativeModule<PCMStreamModuleEvents> implem
   hello(): string;
   initPlayer(sampleRate?: number): void;
   playPCMChunk(chunk: Uint8Array): void;
+  appendPCMBuffer(data: Uint8Array, chunkBytes?: number): void;
   stopPlayback(): void;
+  startRecording(sampleRate?: number, frameSize?: number, targetRate?: number): void;
+  stopRecording(): void;
+  pauseRecordingForPlayback(): void;
+  resumeRecordingAfterPlayback(): void;
 }
 
 export default requireNativeModule<PCMStreamModule>('PCMStream');
