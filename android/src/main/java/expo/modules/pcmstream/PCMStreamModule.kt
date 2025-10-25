@@ -5,119 +5,113 @@ import android.os.Process
 import android.os.SystemClock
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
 import kotlin.math.floor
 
 class PCMStreamModule : Module() {
 
-  private var audioTrack: AudioTrack? = null
-  private var isPlaying = false
-  private val playQueue = LinkedBlockingQueue<ByteArray>()
-  private var playbackThread: Thread? = null
+  // 使用新的 PCMStreamPlayer
+  private var player: PCMStreamPlayer? = null
   private var currentPlaybackSampleRate: Int? = null
-  @Volatile private var lastEnqueueMs: Long = 0L
 
   private var audioRecord: AudioRecord? = null
   private var isRecording = false
   private var recordingThread: Thread? = null
   
-  // 音频反馈控制
-  private var isPlaybackActive = false
-  private var recordingPausedForPlayback = false
+  // 麦克风暂停状态
+  @Volatile private var microphonePausedForPlayback = false
 
-  // 初始化播放
+  // 初始化播放器
   private fun initAudioTrack(sampleRate: Int = 16000) {
-    // 若已在播放且采样率一致，跳过重复初始化，避免多余的 onPlaybackStop 事件
-    if (isPlaying && audioTrack != null && currentPlaybackSampleRate == sampleRate) {
-      return
+    // 如果采样率改变，需要重新创建播放器
+    if (player != null && currentPlaybackSampleRate != sampleRate) {
+      player?.release()
+      player = null
     }
-    if (isPlaying || audioTrack != null) stopPlaybackInternal()
-
-    val bufferSize = AudioTrack.getMinBufferSize(
-      sampleRate,
-      AudioFormat.CHANNEL_OUT_MONO,
-      AudioFormat.ENCODING_PCM_16BIT
-    )
-
-    // 使用STREAM_VOICE_CALL减少反馈，或使用STREAM_MUSIC但降低音量
-    audioTrack = AudioTrack(
-      AudioManager.STREAM_MUSIC, // 使用媒体流，获得更大外放音量
-      sampleRate,
-      AudioFormat.CHANNEL_OUT_MONO,
-      AudioFormat.ENCODING_PCM_16BIT,
-      bufferSize,
-      AudioTrack.MODE_STREAM
-    )
     
-    playQueue.clear()
-    audioTrack?.play()
-    isPlaying = true
-    isPlaybackActive = true
-    currentPlaybackSampleRate = sampleRate
-
-    // 播放开始时暂停录音以防止反馈
-    pauseRecordingForPlayback()
-
-    sendEvent("onPlaybackStart", emptyMap())
-
-    playbackThread = Thread {
-      try {
-        while (isPlaying) {
-          // 使用带超时的poll，便于检测播放是否结束（队列长时间为空）
-          val chunk = playQueue.poll(100, TimeUnit.MILLISECONDS)
-          if (!isPlaying) break
-          if (chunk == null) {
-            val now = SystemClock.elapsedRealtime()
-            // 若近期无新的enqueue且队列为空，判定为播放完成
-            if (playQueue.isEmpty() && lastEnqueueMs > 0L && (now - lastEnqueueMs) > 300) {
-              break
-            }
-            continue
-          }
-          if (chunk.isEmpty()) continue
-          val track = audioTrack ?: continue
-          track.write(chunk, 0, chunk.size)
+    // 创建新播放器（如果不存在）
+    if (player == null) {
+      currentPlaybackSampleRate = sampleRate
+      player = PCMStreamPlayer(
+        sampleRate = sampleRate,
+        channelCount = 1,
+        bytesPerSample = 2,
+        idleTimeoutMs = 2000 // 2秒空闲超时，适应 JS 定时器抖动和网络延迟
+      )
+      
+      // 设置播放状态监听器
+      player?.setPlaybackListener(object : PCMStreamPlayer.PlaybackListener {
+        override fun onPlaybackStart() {
+          android.util.Log.d("PCMStream", "▶️ 播放开始 -> 暂停麦克风")
+          pauseMicrophoneForPlayback()
+          sendEvent("onPlaybackStart", mapOf(
+            "state" to "PLAYING"
+          ))
         }
-      } catch (_: InterruptedException) {
-      } finally {
-        stopPlaybackInternal()
-      }
-    }.also { it.start() }
+        
+        override fun onPlaybackCompleted() {
+          android.util.Log.d("PCMStream", "✅ 播放完成 -> 恢复麦克风")
+          val totalDuration = player?.getTotalDuration() ?: 0.0
+          val playedDuration = player?.getPlayedDuration() ?: 0.0
+          resumeMicrophoneAfterPlayback()
+          sendEvent("onPlaybackStop", mapOf(
+            "state" to "COMPLETED",
+            "totalDuration" to totalDuration,
+            "playedDuration" to playedDuration
+          ))
+        }
+        
+        override fun onPlaybackPaused() {
+          android.util.Log.d("PCMStream", "⏸️ 播放暂停 -> 恢复麦克风")
+          resumeMicrophoneAfterPlayback()
+          sendEvent("onPlaybackPaused", mapOf(
+            "state" to "PAUSED"
+          ))
+        }
+        
+        override fun onPlaybackResumed() {
+          android.util.Log.d("PCMStream", "▶️ 播放恢复 -> 暂停麦克风")
+          pauseMicrophoneForPlayback()
+          sendEvent("onPlaybackResumed", mapOf(
+            "state" to "PLAYING"
+          ))
+        }
+        
+        override fun onProgressUpdate(playedSeconds: Double, totalSeconds: Double, progress: Double) {
+          // 播放进度更新（每秒触发）
+          sendEvent("onPlaybackProgress", mapOf(
+            "playedDuration" to playedSeconds,
+            "totalDuration" to totalSeconds,
+            "progress" to progress,
+            "remainingDuration" to (totalSeconds - playedSeconds)
+          ))
+        }
+        
+        override fun onError(error: Throwable) {
+          android.util.Log.e("PCMStream", "❌ 播放错误: ${error.message}")
+          resumeMicrophoneAfterPlayback()
+          sendEvent("onError", mapOf(
+            "message" to (error.message ?: "Unknown error"),
+            "state" to "ERROR"
+          ))
+        }
+      })
+      
+      android.util.Log.d("PCMStream", "🎵 播放器已初始化 (${sampleRate}Hz)")
+    }
   }
 
+  // 追加 PCM 数据（支持任意大小数据块）
   private fun appendPCMData(chunk: ByteArray) {
     if (chunk.isEmpty()) return
-    playQueue.offer(chunk)
-    lastEnqueueMs = SystemClock.elapsedRealtime()
+    // ✅ 直接 append 完整数据，PCMStreamPlayer 内部会自动处理
+    // - Channel.UNLIMITED 支持任意大小
+    // - writeFully() 会循环写入 AudioTrack
+    player?.append(chunk)
   }
 
-  // 批量追加整段 PCM，原生侧切片入队以减少 JS 循环
-  private fun appendPCMBuffer(data: ByteArray, chunkBytes: Int = 1024) {
-    if (data.isEmpty() || chunkBytes <= 0) return
-    var pos = 0
-    while (pos < data.size) {
-      val end = kotlin.math.min(pos + chunkBytes, data.size)
-      val chunk = data.copyOfRange(pos, end)
-      appendPCMData(chunk)
-      pos = end
-    }
-  }
-
+  // 停止播放
   private fun stopPlaybackInternal() {
-    isPlaying = false
-    isPlaybackActive = false
-    playbackThread?.interrupt()
-    playbackThread = null
-    try { audioTrack?.stop() } catch (_: Throwable) {}
-    try { audioTrack?.release() } catch (_: Throwable) {}
-    audioTrack = null
-    playQueue.clear()
-    
-    // 播放停止后恢复录音
-    resumeRecordingAfterPlayback()
-    
-    sendEvent("onPlaybackStop", emptyMap())
+    player?.stopAndReset()
   }
 
   // 初始化录音 - 修复32ms发送机制
@@ -150,8 +144,8 @@ class PCMStreamModule : Module() {
       var lastSendMs = 0L
       var seq: Long = 0
       while (isRecording) {
-        // 如果播放活跃且录音被暂停，跳过录音数据
-        if (isPlaybackActive && recordingPausedForPlayback) {
+        // 如果麦克风被暂停，跳过录音数据
+        if (microphonePausedForPlayback) {
           Thread.sleep(32) // 等待32ms
           continue
         }
@@ -200,22 +194,22 @@ class PCMStreamModule : Module() {
     try { audioRecord?.stop() } catch (_: Throwable) {}
     try { audioRecord?.release() } catch (_: Throwable) {}
     audioRecord = null
-    recordingPausedForPlayback = false
+    microphonePausedForPlayback = false
   }
   
-  // 播放时暂停录音以防止反馈
-  private fun pauseRecordingForPlayback() {
-    if (isRecording && !recordingPausedForPlayback) {
-      recordingPausedForPlayback = true
-      android.util.Log.d("PCMStream", "🔇 播放开始，暂停录音防止反馈")
+  // 播放时暂停麦克风（防止音频反馈）
+  private fun pauseMicrophoneForPlayback() {
+    if (isRecording && !microphonePausedForPlayback) {
+      microphonePausedForPlayback = true
+      android.util.Log.d("PCMStream", "🔇 麦克风已暂停")
     }
   }
   
-  // 播放停止后恢复录音
-  private fun resumeRecordingAfterPlayback() {
-    if (recordingPausedForPlayback) {
-      recordingPausedForPlayback = false
-      android.util.Log.d("PCMStream", "🎤 播放停止，恢复录音")
+  // 播放停止后恢复麦克风
+  private fun resumeMicrophoneAfterPlayback() {
+    if (microphonePausedForPlayback) {
+      microphonePausedForPlayback = false
+      android.util.Log.d("PCMStream", "🎤 麦克风已恢复")
     }
   }
 
@@ -238,28 +232,99 @@ class PCMStreamModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("PCMStream")
 
-    Events("onError", "onPlaybackStart", "onPlaybackStop", "onAudioFrame")
+    Events("onError", "onPlaybackStart", "onPlaybackStop", "onPlaybackPaused", "onPlaybackResumed", "onPlaybackProgress", "onAudioFrame")
 
     // 播放相关
     Function("initPlayer") { sampleRate: Int? -> initAudioTrack(sampleRate ?: 16000) }
     Function("playPCMChunk") { chunk: ByteArray -> appendPCMData(chunk) }
-    Function("appendPCMBuffer") { data: ByteArray, chunkBytes: Int? ->
-      appendPCMBuffer(data, (chunkBytes ?: 1024))
-    }
     Function("stopPlayback") { stopPlaybackInternal() }
+    
+    // ===== 新增：播放状态和时间统计 =====
+    
+    /**
+     * 获取当前播放状态
+     * @return 状态字符串: "IDLE" | "PLAYING" | "PAUSED" | "COMPLETED"
+     */
+    Function("getPlaybackState") {
+      player?.getState()?.name ?: "IDLE"
+    }
+    
+    /**
+     * 检查是否正在播放
+     * @return true 表示正在播放中
+     */
+    Function("isPlaying") {
+      player?.isActivelyPlaying() ?: false
+    }
+    
+    /**
+     * 获取已追加数据的总预计播放时长（秒）
+     * @return 总时长（秒）
+     */
+    Function("getTotalDuration") {
+      player?.getTotalDuration() ?: 0.0
+    }
+    
+    /**
+     * 获取已播放的时长（秒）
+     * @return 已播放时长（秒）
+     */
+    Function("getPlayedDuration") {
+      player?.getPlayedDuration() ?: 0.0
+    }
+    
+    /**
+     * 获取剩余播放时长（秒）
+     * @return 剩余时长（秒）
+     */
+    Function("getRemainingDuration") {
+      player?.getRemainingDuration() ?: 0.0
+    }
+    
+    /**
+     * 获取播放进度（0.0 ~ 1.0）
+     * @return 播放进度百分比
+     */
+    Function("getProgress") {
+      player?.getProgress() ?: 0.0
+    }
+    
+    /**
+     * 获取完整的播放统计信息
+     * @return Map 包含所有统计数据
+     */
+    Function("getPlaybackStats") {
+      val p = player
+      if (p == null) {
+        mapOf(
+          "state" to "IDLE",
+          "isPlaying" to false,
+          "totalDuration" to 0.0,
+          "playedDuration" to 0.0,
+          "remainingDuration" to 0.0,
+          "progress" to 0.0
+        )
+      } else {
+        mapOf(
+          "state" to p.getState().name,
+          "isPlaying" to p.isActivelyPlaying(),
+          "totalDuration" to p.getTotalDuration(),
+          "playedDuration" to p.getPlayedDuration(),
+          "remainingDuration" to p.getRemainingDuration(),
+          "progress" to p.getProgress()
+        )
+      }
+    }
 
     // 录音相关
     Function("startRecording") { sampleRate: Int?, frameSize: Int?, targetRate: Int? ->
       startRecording(sampleRate ?: 48000, frameSize ?: 1536, targetRate ?: 16000)
     }
     Function("stopRecording") { stopRecordingInternal() }
-    
-    // 反馈控制
-    Function("pauseRecordingForPlayback") { pauseRecordingForPlayback() }
-    Function("resumeRecordingAfterPlayback") { resumeRecordingAfterPlayback() }
 
     OnDestroy {
-      stopPlaybackInternal()
+      player?.release()
+      player = null
       stopRecordingInternal()
     }
   }
