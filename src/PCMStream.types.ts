@@ -40,6 +40,10 @@ export type OnPlaybackProgressEventPayload = {
   remainingDuration: number; // 剩余时长（秒）
 };
 
+export type OnAmplitudeUpdateEventPayload = {
+  amplitude: number;         // 音频振幅（0.0 ~ 1.0），用于口型同步
+};
+
 export type PCMStreamModuleEvents = {
   onError?: (params: OnErrorEventPayload) => void;
   onPlaybackStart?: (params: OnPlaybackStartEventPayload) => void;
@@ -47,6 +51,7 @@ export type PCMStreamModuleEvents = {
   onPlaybackPaused?: (params: OnPlaybackPausedEventPayload) => void;
   onPlaybackResumed?: (params: OnPlaybackResumedEventPayload) => void;
   onPlaybackProgress?: (params: OnPlaybackProgressEventPayload) => void;
+  onAmplitudeUpdate?: (params: OnAmplitudeUpdateEventPayload) => void;
   onAudioFrame?: (params: OnAudioFrameEventPayload) => void;
 };
 

@@ -86,6 +86,13 @@ class PCMStreamModule : Module() {
           ))
         }
         
+        override fun onAmplitudeUpdate(amplitude: Double) {
+          // 音频振幅更新（用于口型同步，约每 16ms 触发）
+          sendEvent("onAmplitudeUpdate", mapOf(
+            "amplitude" to amplitude
+          ))
+        }
+        
         override fun onError(error: Throwable) {
           android.util.Log.e("PCMStream", "❌ 播放错误: ${error.message}")
           resumeMicrophoneAfterPlayback()
@@ -232,7 +239,7 @@ class PCMStreamModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("PCMStream")
 
-    Events("onError", "onPlaybackStart", "onPlaybackStop", "onPlaybackPaused", "onPlaybackResumed", "onPlaybackProgress", "onAudioFrame")
+    Events("onError", "onPlaybackStart", "onPlaybackStop", "onPlaybackPaused", "onPlaybackResumed", "onPlaybackProgress", "onAmplitudeUpdate", "onAudioFrame")
 
     // 播放相关
     Function("initPlayer") { sampleRate: Int? -> initAudioTrack(sampleRate ?: 16000) }

@@ -62,6 +62,9 @@ class PCMStreamPlayer(
         
         /** 播放进度更新（每秒触发一次） */
         fun onProgressUpdate(playedSeconds: Double, totalSeconds: Double, progress: Double)
+        
+        /** 音频振幅更新（用于口型同步，约每 16ms 触发一次） */
+        fun onAmplitudeUpdate(amplitude: Double)
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -77,6 +80,10 @@ class PCMStreamPlayer(
     @Volatile private var totalBytesAppended: Long = 0L    // 累计追加的总字节数
     @Volatile private var totalBytesPlayed: Long = 0L      // 已播放的字节数
     @Volatile private var lastProgressReportTimeMs: Long = 0L  // 上次进度报告时间
+    
+    // ===== 音频振幅分析（用于口型同步） =====
+    @Volatile private var lastAmplitudeReportTimeMs: Long = 0L  // 上次振幅报告时间
+    private val amplitudeUpdateInterval = 16L  // 振幅更新间隔（约 60fps）
     
     private var listener: PlaybackListener? = null
     private var playbackJob: Job? = null
@@ -369,8 +376,9 @@ class PCMStreamPlayer(
                 // ===== 更新已播放字节数 =====
                 totalBytesPlayed += written
                 
-                // ===== 定期报告播放进度（每秒一次） =====
                 val now = SystemClock.elapsedRealtime()
+                
+                // ===== 定期报告播放进度（每秒一次） =====
                 if (now - lastProgressReportTimeMs >= 1000) {
                     lastProgressReportTimeMs = now
                     val playedSeconds = getPlayedDuration()
@@ -383,11 +391,56 @@ class PCMStreamPlayer(
                         "⏱️ 播放进度: %.2f / %.2f 秒 (%.1f%%)".format(
                             playedSeconds, totalSeconds, progress * 100))
                 }
+                
+                // ===== 计算并报告音频振幅（用于口型同步，约每 16ms 一次） =====
+                if (now - lastAmplitudeReportTimeMs >= amplitudeUpdateInterval) {
+                    lastAmplitudeReportTimeMs = now
+                    // 计算当前写入数据块的振幅
+                    val amplitude = calculateAmplitude(bytes, offset - written, written)
+                    listener?.onAmplitudeUpdate(amplitude)
+                }
             } else {
                 // write 返回 0 或负值时短暂休眠避免死循环
                 Thread.sleep(5)
             }
         }
+    }
+    
+    /**
+     * 计算音频数据的 RMS 振幅
+     * 
+     * @param bytes PCM 16-bit 字节数组
+     * @param offset 起始偏移
+     * @param length 要计算的字节数
+     * @return 振幅值（0.0 ~ 1.0）
+     */
+    private fun calculateAmplitude(bytes: ByteArray, offset: Int, length: Int): Double {
+        if (length < 2) return 0.0
+        
+        var sum = 0.0
+        var count = 0
+        
+        // PCM 16-bit little-endian 格式，每两个字节组成一个样本
+        var i = offset
+        while (i < offset + length - 1) {
+            // 读取 16-bit 样本（小端序）
+            val sample = ((bytes[i + 1].toInt() shl 8) or (bytes[i].toInt() and 0xFF)).toShort()
+            // 归一化到 -1.0 ~ 1.0
+            val normalized = sample.toDouble() / Short.MAX_VALUE
+            // 累加平方
+            sum += normalized * normalized
+            count++
+            i += 2
+        }
+        
+        if (count == 0) return 0.0
+        
+        // 计算 RMS（均方根）
+        val rms = kotlin.math.sqrt(sum / count)
+        
+        // 放大映射到嘴巴开合范围，类似 Web 版的 rms * 8
+        // 限制在 0.0 ~ 1.0 范围
+        return (rms * 8.0).coerceIn(0.0, 1.0)
     }
 
     /**
