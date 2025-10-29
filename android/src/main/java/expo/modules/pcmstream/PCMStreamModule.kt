@@ -150,46 +150,60 @@ class PCMStreamModule : Module() {
       val framePeriodMs = ((frameSize.toDouble() / sampleRate.toDouble()) * 1000.0).toLong().coerceAtLeast(1)
       var lastSendMs = 0L
       var seq: Long = 0
-      while (isRecording) {
-        // 如果麦克风被暂停，跳过录音数据
-        if (microphonePausedForPlayback) {
-          Thread.sleep(32) // 等待32ms
-          continue
-        }
-        
-        val read = audioRecord?.read(buffer, 0, frameSize) ?: 0
-        if (read > 0) {
-          // 重采样：从48kHz到16kHz，1536样本变成512样本（32ms）
-          val resampled = resampleAudio(buffer, read, sampleRate, targetRate)
-          
-          // 转 ByteArray
-          val byteBuf = ByteArray(resampled.size * 2)
-          var idx = 0
-          for (s in resampled) {
-            byteBuf[idx++] = (s.toInt() and 0xFF).toByte()
-            byteBuf[idx++] = ((s.toInt() shr 8) and 0xFF).toByte()
+      
+      try {
+        while (isRecording) {
+          // 如果麦克风被暂停，跳过录音数据
+          if (microphonePausedForPlayback) {
+            try { Thread.sleep(32) } catch (_: InterruptedException) { break }
+            continue
           }
           
-          // 固定节拍控制：确保 onAudioFrame 发出间隔不小于 framePeriodMs
-          val nowMs = SystemClock.elapsedRealtime()
-          if (lastSendMs > 0) {
-            val elapsed = nowMs - lastSendMs
-            val sleepMs = framePeriodMs - elapsed
-            if (sleepMs > 0) {
-              try { Thread.sleep(sleepMs) } catch (_: Throwable) {}
+          val read = audioRecord?.read(buffer, 0, frameSize) ?: 0
+          if (read > 0) {
+            // 重采样：从48kHz到16kHz，1536样本变成512样本（32ms）
+            val resampled = resampleAudio(buffer, read, sampleRate, targetRate)
+            
+            // 转 ByteArray
+            val byteBuf = ByteArray(resampled.size * 2)
+            var idx = 0
+            for (s in resampled) {
+              byteBuf[idx++] = (s.toInt() and 0xFF).toByte()
+              byteBuf[idx++] = ((s.toInt() shr 8) and 0xFF).toByte()
             }
-          }
-          val tsMs = SystemClock.elapsedRealtime()
-          seq += 1
-          lastSendMs = tsMs
+            
+            // 固定节拍控制：确保 onAudioFrame 发出间隔不小于 framePeriodMs
+            val nowMs = SystemClock.elapsedRealtime()
+            if (lastSendMs > 0) {
+              val elapsed = nowMs - lastSendMs
+              val sleepMs = framePeriodMs - elapsed
+              if (sleepMs > 0) {
+                try { 
+                  Thread.sleep(sleepMs) 
+                } catch (_: InterruptedException) {
+                  // 被中断，重新抛出以便外层捕获
+                  throw InterruptedException("Recording thread interrupted during sleep")
+                }
+              }
+            }
+            val tsMs = SystemClock.elapsedRealtime()
+            seq += 1
+            lastSendMs = tsMs
 
-          // 发送事件到 JS - 附带时间戳与序号
-          sendEvent("onAudioFrame", mapOf(
-            "pcm" to byteBuf,
-            "ts" to tsMs,
-            "seq" to seq
-          ))
+            // 发送事件到 JS - 附带时间戳与序号
+            sendEvent("onAudioFrame", mapOf(
+              "pcm" to byteBuf,
+              "ts" to tsMs,
+              "seq" to seq
+            ))
+          }
         }
+      } catch (e: InterruptedException) {
+        // 线程被中断，正常退出（例如停止录音时）
+        android.util.Log.d("PCMStream", "📍 录音线程被中断，正常退出")
+      } catch (e: Exception) {
+        // 其他异常
+        android.util.Log.e("PCMStream", "❌ 录音线程异常: ${e.message}", e)
       }
     }.also { it.start() }
   }
