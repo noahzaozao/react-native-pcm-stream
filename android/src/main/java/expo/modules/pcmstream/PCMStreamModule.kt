@@ -1,6 +1,7 @@
 package expo.modules.pcmstream
 
 import android.media.*
+import android.media.audiofx.AcousticEchoCanceler
 import android.os.Process
 import android.os.SystemClock
 import expo.modules.kotlin.modules.Module
@@ -14,11 +15,9 @@ class PCMStreamModule : Module() {
   private var currentPlaybackSampleRate: Int? = null
 
   private var audioRecord: AudioRecord? = null
+  private var aec: AcousticEchoCanceler? = null
   private var isRecording = false
   private var recordingThread: Thread? = null
-  
-  // 麦克风暂停状态
-  @Volatile private var microphonePausedForPlayback = false
 
   // 初始化播放器
   private fun initAudioTrack(sampleRate: Int = 16000) {
@@ -41,18 +40,16 @@ class PCMStreamModule : Module() {
       // 设置播放状态监听器
       player?.setPlaybackListener(object : PCMStreamPlayer.PlaybackListener {
         override fun onPlaybackStart() {
-          android.util.Log.d("PCMStream", "▶️ 播放开始 -> 暂停麦克风")
-          pauseMicrophoneForPlayback()
+          android.util.Log.d("PCMStream", "▶️ 播放开始（AEC 已启用，麦克风保持开启）")
           sendEvent("onPlaybackStart", mapOf(
             "state" to "PLAYING"
           ))
         }
         
         override fun onPlaybackCompleted() {
-          android.util.Log.d("PCMStream", "✅ 播放完成 -> 恢复麦克风")
+          android.util.Log.d("PCMStream", "✅ 播放完成")
           val totalDuration = player?.getTotalDuration() ?: 0.0
           val playedDuration = player?.getPlayedDuration() ?: 0.0
-          resumeMicrophoneAfterPlayback()
           sendEvent("onPlaybackStop", mapOf(
             "state" to "COMPLETED",
             "totalDuration" to totalDuration,
@@ -61,16 +58,14 @@ class PCMStreamModule : Module() {
         }
         
         override fun onPlaybackPaused() {
-          android.util.Log.d("PCMStream", "⏸️ 播放暂停 -> 恢复麦克风")
-          resumeMicrophoneAfterPlayback()
+          android.util.Log.d("PCMStream", "⏸️ 播放暂停")
           sendEvent("onPlaybackPaused", mapOf(
             "state" to "PAUSED"
           ))
         }
         
         override fun onPlaybackResumed() {
-          android.util.Log.d("PCMStream", "▶️ 播放恢复 -> 暂停麦克风")
-          pauseMicrophoneForPlayback()
+          android.util.Log.d("PCMStream", "▶️ 播放恢复")
           sendEvent("onPlaybackResumed", mapOf(
             "state" to "PLAYING"
           ))
@@ -95,7 +90,6 @@ class PCMStreamModule : Module() {
         
         override fun onError(error: Throwable) {
           android.util.Log.e("PCMStream", "❌ 播放错误: ${error.message}")
-          resumeMicrophoneAfterPlayback()
           sendEvent("onError", mapOf(
             "message" to (error.message ?: "Unknown error"),
             "state" to "ERROR"
@@ -132,7 +126,7 @@ class PCMStreamModule : Module() {
     )
 
     audioRecord = AudioRecord(
-      MediaRecorder.AudioSource.MIC,
+      MediaRecorder.AudioSource.VOICE_COMMUNICATION,
       sampleRate,
       AudioFormat.CHANNEL_IN_MONO,
       AudioFormat.ENCODING_PCM_16BIT,
@@ -141,6 +135,17 @@ class PCMStreamModule : Module() {
 
     isRecording = true
     audioRecord?.startRecording()
+
+    // 挂载硬件回声消除（AEC），允许播放时同时录音
+    val audioSessionId = audioRecord?.audioSessionId ?: AudioRecord.ERROR
+    if (audioSessionId != AudioRecord.ERROR && AcousticEchoCanceler.isAvailable()) {
+      aec?.release()
+      aec = AcousticEchoCanceler.create(audioSessionId)
+      aec?.enabled = true
+      android.util.Log.d("PCMStream", "✅ AEC 已启用 (sessionId=$audioSessionId)")
+    } else {
+      android.util.Log.w("PCMStream", "⚠️ AEC 不可用，回声消除未启用")
+    }
 
     recordingThread = Thread {
       // 提升录音线程优先级，降低调度抖动
@@ -153,12 +158,6 @@ class PCMStreamModule : Module() {
       
       try {
         while (isRecording) {
-          // 如果麦克风被暂停，跳过录音数据
-          if (microphonePausedForPlayback) {
-            try { Thread.sleep(32) } catch (_: InterruptedException) { break }
-            continue
-          }
-          
           val read = audioRecord?.read(buffer, 0, frameSize) ?: 0
           if (read > 0) {
             // 重采样：从48kHz到16kHz，1536样本变成512样本（32ms）
@@ -212,26 +211,11 @@ class PCMStreamModule : Module() {
     isRecording = false
     recordingThread?.interrupt()
     recordingThread = null
+    try { aec?.release() } catch (_: Throwable) {}
+    aec = null
     try { audioRecord?.stop() } catch (_: Throwable) {}
     try { audioRecord?.release() } catch (_: Throwable) {}
     audioRecord = null
-    microphonePausedForPlayback = false
-  }
-  
-  // 播放时暂停麦克风（防止音频反馈）
-  private fun pauseMicrophoneForPlayback() {
-    if (isRecording && !microphonePausedForPlayback) {
-      microphonePausedForPlayback = true
-      android.util.Log.d("PCMStream", "🔇 麦克风已暂停")
-    }
-  }
-  
-  // 播放停止后恢复麦克风
-  private fun resumeMicrophoneAfterPlayback() {
-    if (microphonePausedForPlayback) {
-      microphonePausedForPlayback = false
-      android.util.Log.d("PCMStream", "🎤 麦克风已恢复")
-    }
   }
 
   // 线性插值重采样
