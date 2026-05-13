@@ -4,21 +4,20 @@ package expo.modules.pcmstream
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.SystemClock
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.TimeUnit
+import java.util.ArrayDeque
 
 /**
  * PCM 流式播放器
- * 
+ *
  * 使用协程和 Channel 实现的高性能音频播放器
  * 支持实时流式播放，自动管理缓冲队列
- * 
+ *
  * @param sampleRate 采样率，默认 44100 Hz
  * @param channelCount 声道数，1 = 单声道，2 = 立体声
  * @param bytesPerSample 每样本字节数，2 = 16-bit PCM
@@ -47,22 +46,22 @@ class PCMStreamPlayer(
     interface PlaybackListener {
         /** 播放开始 */
         fun onPlaybackStart()
-        
+
         /** 播放完成（队列为空且超时） */
         fun onPlaybackCompleted()
-        
+
         /** 播放暂停 */
         fun onPlaybackPaused()
-        
+
         /** 播放恢复 */
         fun onPlaybackResumed()
-        
+
         /** 发生错误 */
         fun onError(error: Throwable)
-        
+
         /** 播放进度更新（每秒触发一次） */
         fun onProgressUpdate(playedSeconds: Double, totalSeconds: Double, progress: Double)
-        
+
         /** 音频振幅更新（用于口型同步，约每 16ms 触发一次） */
         fun onAmplitudeUpdate(amplitude: Double)
     }
@@ -70,21 +69,31 @@ class PCMStreamPlayer(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var audioTrack: AudioTrack? = null
     private val bufferChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
-    
+
     @Volatile private var isPlaying = false
     @Volatile private var currentState: PlaybackState = PlaybackState.IDLE
     @Volatile private var lastAppendTimeMs: Long = 0L
     @Volatile private var totalBytesWritten: Long = 0L  // 写入 AudioTrack 的总字节数
-    
+
     // ===== 播放时间统计 =====
     @Volatile private var totalBytesAppended: Long = 0L    // 累计追加的总字节数
     @Volatile private var totalBytesPlayed: Long = 0L      // 已播放的字节数
     @Volatile private var lastProgressReportTimeMs: Long = 0L  // 上次进度报告时间
-    
+
     // ===== 音频振幅分析（用于口型同步） =====
-    @Volatile private var lastAmplitudeReportTimeMs: Long = 0L  // 上次振幅报告时间
     private val amplitudeUpdateInterval = 16L  // 振幅更新间隔（约 60fps）
-    
+    private val amplitudeWindowMs = 32L        // 当前播放头附近的分析窗口
+
+    private data class AmplitudeSegment(
+        val startFrame: Long,
+        val frameCount: Int,
+        val bytes: ByteArray
+    )
+
+    private val amplitudeLock = Any()
+    private val amplitudeSegments = ArrayDeque<AmplitudeSegment>()
+    private var amplitudeJob: Job? = null
+
     private var listener: PlaybackListener? = null
     private var playbackJob: Job? = null
 
@@ -125,7 +134,7 @@ class PCMStreamPlayer(
 
     /**
      * 设置播放状态监听器
-     * 
+     *
      * @param listener 状态监听器，为 null 时移除监听
      */
     fun setPlaybackListener(listener: PlaybackListener?) {
@@ -134,67 +143,213 @@ class PCMStreamPlayer(
 
     /**
      * 获取当前播放状态
-     * 
+     *
      * @return 当前状态
      */
     fun getState(): PlaybackState = currentState
 
     /**
      * 是否正在播放中
-     * 
+     *
      * @return true 表示正在播放
      */
     fun isActivelyPlaying(): Boolean = currentState == PlaybackState.PLAYING
 
     // ===== 播放时间统计方法 =====
-    
+
     /**
      * 获取已追加数据的总预计播放时长（秒）
-     * 
+     *
      * @return 总播放时长（秒）
      */
     fun getTotalDuration(): Double {
         return bytesToSeconds(totalBytesAppended)
     }
-    
+
     /**
      * 获取已播放的时长（秒）
-     * 
+     *
      * @return 已播放时长（秒）
      */
     fun getPlayedDuration(): Double {
-        return bytesToSeconds(totalBytesPlayed)
+        return bytesToSeconds(updatePlayedBytesFromAudioTrack())
     }
-    
+
     /**
      * 获取剩余播放时长（秒）
-     * 
+     *
      * @return 剩余播放时长（秒）
      */
     fun getRemainingDuration(): Double {
-        val remaining = totalBytesAppended - totalBytesPlayed
+        val remaining = totalBytesAppended - updatePlayedBytesFromAudioTrack()
         return if (remaining > 0) bytesToSeconds(remaining) else 0.0
     }
-    
+
     /**
      * 获取播放进度百分比（0.0 ~ 1.0）
-     * 
+     *
      * @return 播放进度，0.0 表示未开始，1.0 表示完成
      */
     fun getProgress(): Double {
         if (totalBytesAppended == 0L) return 0.0
-        return (totalBytesPlayed.toDouble() / totalBytesAppended).coerceIn(0.0, 1.0)
+        return (updatePlayedBytesFromAudioTrack().toDouble() / totalBytesAppended).coerceIn(0.0, 1.0)
     }
-    
+
     /**
      * 字节数转换为播放时长（秒）
-     * 
+     *
      * @param bytes 字节数
      * @return 播放时长（秒）
      */
     private fun bytesToSeconds(bytes: Long): Double {
-        val bytesPerSecond = sampleRate * channelCount * bytesPerSample
+        val bytesPerSecond = sampleRate * bytesPerFrame()
         return bytes.toDouble() / bytesPerSecond
+    }
+
+    private fun bytesPerFrame(): Int {
+        return channelCount * bytesPerSample
+    }
+
+    private fun playbackHeadFramePosition(): Long {
+        val at = audioTrack ?: return 0L
+        return Integer.toUnsignedLong(at.playbackHeadPosition)
+    }
+
+    private fun updatePlayedBytesFromAudioTrack(): Long {
+        val playedBytes = (playbackHeadFramePosition() * bytesPerFrame()).coerceAtMost(totalBytesWritten)
+        totalBytesPlayed = playedBytes
+        return playedBytes
+    }
+
+    private fun clearAmplitudeHistory() {
+        synchronized(amplitudeLock) {
+            amplitudeSegments.clear()
+        }
+    }
+
+    private fun appendAmplitudeSegment(pcmData: ByteArray) {
+        val frameSize = bytesPerFrame()
+        if (frameSize <= 0) return
+
+        val frameCount = pcmData.size / frameSize
+        if (frameCount <= 0) return
+
+        val startFrame = totalBytesAppended / frameSize
+        synchronized(amplitudeLock) {
+            amplitudeSegments.add(
+                AmplitudeSegment(
+                    startFrame = startFrame,
+                    frameCount = frameCount,
+                    bytes = pcmData.copyOf()
+                )
+            )
+        }
+    }
+
+    private fun pruneAmplitudeHistory(beforeFrame: Long) {
+        synchronized(amplitudeLock) {
+            while (!amplitudeSegments.isEmpty()) {
+                val first = amplitudeSegments.peekFirst() ?: break
+                val firstEnd = first.startFrame + first.frameCount
+                if (firstEnd > beforeFrame) break
+                amplitudeSegments.removeFirst()
+            }
+        }
+    }
+
+    private fun calculateAmplitudeAtPlaybackFrame(startFrame: Long): Double {
+        val frameSize = bytesPerFrame()
+        if (frameSize <= 0 || bytesPerSample != 2) return 0.0
+
+        val windowFrames = ((sampleRate * amplitudeWindowMs) / 1000L).coerceAtLeast(1L)
+        val endFrame = startFrame + windowFrames
+        var sum = 0.0
+        var count = 0
+
+        synchronized(amplitudeLock) {
+            val iterator = amplitudeSegments.iterator()
+            while (iterator.hasNext()) {
+                val segment = iterator.next()
+                val segmentEnd = segment.startFrame + segment.frameCount
+
+                if (segmentEnd <= startFrame - windowFrames) {
+                    iterator.remove()
+                    continue
+                }
+                if (segment.startFrame >= endFrame) {
+                    break  // 后续 segment 更靠后，不可能在窗口内
+                }
+                if (segmentEnd <= startFrame) {
+                    continue
+                }
+
+                val fromFrame = maxOf(startFrame, segment.startFrame)
+                val toFrame = minOf(endFrame, segmentEnd)
+                var byteOffset = ((fromFrame - segment.startFrame) * frameSize).toInt()
+                val byteEnd = ((toFrame - segment.startFrame) * frameSize).toInt()
+
+                while (byteOffset < byteEnd - 1) {
+                    val sample = ((segment.bytes[byteOffset + 1].toInt() shl 8) or
+                        (segment.bytes[byteOffset].toInt() and 0xFF)).toShort()
+                    val normalized = sample.toDouble() / Short.MAX_VALUE
+                    sum += normalized * normalized
+                    count++
+                    byteOffset += bytesPerSample
+                }
+            }
+        }
+
+        if (count == 0) return 0.0
+
+        val rms = kotlin.math.sqrt(sum / count)
+        return (rms * 8.0).coerceIn(0.0, 1.0)
+    }
+
+    private fun startAmplitudeReporter() {
+        if (amplitudeJob?.isActive == true) return
+
+        android.util.Log.d("PCMStreamPlayer", "👄 AmplitudeReporter 启动")
+        amplitudeJob = scope.launch {
+            var tickCount = 0
+            while (isPlaying) {
+                if (currentState == PlaybackState.PLAYING) {
+                    val headFrame = playbackHeadFramePosition()
+                    updatePlayedBytesFromAudioTrack()
+
+                    val now = SystemClock.elapsedRealtime()
+                    val amplitude = calculateAmplitudeAtPlaybackFrame(headFrame)
+                    listener?.onAmplitudeUpdate(amplitude)
+
+                    tickCount++
+                    if (tickCount <= 3 || tickCount % 60 == 0) {
+                        android.util.Log.d("PCMStreamPlayer",
+                            "👄 tick#$tickCount headFrame=$headFrame amp=%.4f segments=${amplitudeSegments.size}".format(amplitude))
+                    }
+
+                    if (now - lastProgressReportTimeMs >= 1000) {
+                        lastProgressReportTimeMs = now
+                        val playedSeconds = getPlayedDuration()
+                        val totalSeconds = getTotalDuration()
+                        val progress = getProgress()
+
+                        listener?.onProgressUpdate(playedSeconds, totalSeconds, progress)
+
+                        android.util.Log.d("PCMStreamPlayer",
+                            "⏱️ 播放进度: %.2f / %.2f 秒 (%.1f%%)".format(
+                                playedSeconds, totalSeconds, progress * 100))
+                    }
+
+                    // 保留 200ms 历史足够 32ms 窗口使用
+                    pruneAmplitudeHistory(headFrame - (sampleRate / 5L).coerceAtLeast(1L))
+                } else {
+                    listener?.onAmplitudeUpdate(0.0)
+                }
+
+                delay(amplitudeUpdateInterval)
+            }
+
+            listener?.onAmplitudeUpdate(0.0)
+        }
     }
 
     /**
@@ -210,6 +365,7 @@ class PCMStreamPlayer(
                 audioTrack?.play()
                 listener?.onPlaybackResumed()
                 android.util.Log.d("PCMStreamPlayer", "▶️ 播放恢复")
+                startAmplitudeReporter()
             }
             return
         }
@@ -218,9 +374,10 @@ class PCMStreamPlayer(
         isPlaying = true
         currentState = PlaybackState.PLAYING
         audioTrack?.play()
-        
+
         listener?.onPlaybackStart()
         android.util.Log.d("PCMStreamPlayer", "▶️ 播放开始")
+        startAmplitudeReporter()
 
         playbackJob = scope.launch {
             try {
@@ -229,13 +386,13 @@ class PCMStreamPlayer(
                     val chunk = withTimeoutOrNull(100) {
                         bufferChannel.receive()
                     }
-                    
+
                     if (!isPlaying) break
-                    
+
                     if (chunk == null) {
                         // 超时未收到数据，检查是否播放完成
                         val now = SystemClock.elapsedRealtime()
-                        if (bufferChannel.isEmpty && lastAppendTimeMs > 0L && 
+                        if (bufferChannel.isEmpty && lastAppendTimeMs > 0L &&
                             (now - lastAppendTimeMs) > idleTimeoutMs) {
                             // 队列为空且超过超时时间，需要确认 AudioTrack 真正播放完成
                             if (isAudioTrackPlaybackFinished()) {
@@ -248,7 +405,7 @@ class PCMStreamPlayer(
                         }
                         continue
                     }
-                    
+
                     if (chunk.isEmpty()) continue
                     writeFully(chunk)
                 }
@@ -264,37 +421,36 @@ class PCMStreamPlayer(
 
     /**
      * 检查 AudioTrack 是否真正播放完成
-     * 
+     *
      * @return true 表示播放完成，false 表示仍在播放
      */
     private fun isAudioTrackPlaybackFinished(): Boolean {
         val at = audioTrack ?: return true
-        
+
         try {
             // 检查 AudioTrack 的播放状态
             val playState = at.playState
             if (playState != AudioTrack.PLAYSTATE_PLAYING) {
                 return true
             }
-            
+
             // 获取播放头位置（单位：帧）
-            val playbackHeadPosition = at.playbackHeadPosition
-            
+            val playbackHeadPosition = playbackHeadFramePosition()
+
             // 计算已写入的总帧数
-            val bytesPerFrame = channelCount * bytesPerSample
-            val totalFramesWritten = totalBytesWritten / bytesPerFrame
-            
+            val totalFramesWritten = totalBytesWritten / bytesPerFrame()
+
             // ⚠️ 关键：必须等待播放头完全追上写入位置
             // playbackHeadPosition 是扬声器输出位置，落后于写入位置
             // 硬件缓冲区通常有 100-300ms 延迟，因此不能用 margin
             val finished = playbackHeadPosition >= totalFramesWritten
-            
+
             if (!finished) {
                 val remainingMs = ((totalFramesWritten - playbackHeadPosition).toDouble() / sampleRate * 1000).toInt()
-                android.util.Log.d("PCMStreamPlayer", 
+                android.util.Log.d("PCMStreamPlayer",
                     "📍 播放头: $playbackHeadPosition / $totalFramesWritten 帧 (剩余: ${remainingMs}ms)")
             }
-            
+
             return finished
         } catch (e: Exception) {
             android.util.Log.w("PCMStreamPlayer", "检查播放状态失败: ${e.message}")
@@ -312,10 +468,12 @@ class PCMStreamPlayer(
             // 硬件缓冲区通常有 100-300ms 延迟，这里等待 500ms 确保安全
             android.util.Log.d("PCMStreamPlayer", "⏳ 等待硬件缓冲区清空...")
             Thread.sleep(500)
-            
+
             currentState = PlaybackState.COMPLETED
             isPlaying = false
             audioTrack?.pause()
+            updatePlayedBytesFromAudioTrack()
+            listener?.onAmplitudeUpdate(0.0)
             listener?.onPlaybackCompleted()
         }
     }
@@ -323,36 +481,37 @@ class PCMStreamPlayer(
     /**
      * 追加 PCM 数据到播放队列
      * 非阻塞操作，调用方可以来自网络回调、文件读流等
-     * 
+     *
      * @param pcmData PCM 音频数据（16-bit little-endian）
      */
     fun append(pcmData: ByteArray) {
         if (pcmData.isEmpty()) return
-        
+
         // 如果是完成状态，收到新数据则重新开始
         if (currentState == PlaybackState.COMPLETED) {
             currentState = PlaybackState.IDLE
             isPlaying = false
             android.util.Log.d("PCMStreamPlayer", "🔄 收到新数据，重置完成状态")
         }
-        
+
         if (!isPlaying) {
             // 自动启动播放
             start()
         }
-        
+
         // 更新最后追加时间
         lastAppendTimeMs = SystemClock.elapsedRealtime()
-        
+        appendAmplitudeSegment(pcmData)
+
         // ===== 统计播放时间 =====
         totalBytesAppended += pcmData.size
         val chunkDuration = bytesToSeconds(pcmData.size.toLong())
         val totalDuration = getTotalDuration()
-        
-        android.util.Log.d("PCMStreamPlayer", 
+
+        android.util.Log.d("PCMStreamPlayer",
             "📊 追加音频: ${pcmData.size} 字节 (%.3f 秒) | 累计总时长: %.3f 秒"
                 .format(chunkDuration, totalDuration))
-        
+
         // 发送到 channel（尽量不阻塞调用者）
         bufferChannel.trySend(pcmData).getOrThrow()
     }
@@ -369,78 +528,15 @@ class PCMStreamPlayer(
             val written = at.write(bytes, offset, size - offset)
             if (written > 0) {
                 offset += written
-                
+
                 // ===== 更新已写入字节数（用于播放完成检测） =====
                 totalBytesWritten += written
-                
-                // ===== 更新已播放字节数 =====
-                totalBytesPlayed += written
-                
-                val now = SystemClock.elapsedRealtime()
-                
-                // ===== 定期报告播放进度（每秒一次） =====
-                if (now - lastProgressReportTimeMs >= 1000) {
-                    lastProgressReportTimeMs = now
-                    val playedSeconds = getPlayedDuration()
-                    val totalSeconds = getTotalDuration()
-                    val progress = getProgress()
-                    
-                    listener?.onProgressUpdate(playedSeconds, totalSeconds, progress)
-                    
-                    android.util.Log.d("PCMStreamPlayer", 
-                        "⏱️ 播放进度: %.2f / %.2f 秒 (%.1f%%)".format(
-                            playedSeconds, totalSeconds, progress * 100))
-                }
-                
-                // ===== 计算并报告音频振幅（用于口型同步，约每 16ms 一次） =====
-                if (now - lastAmplitudeReportTimeMs >= amplitudeUpdateInterval) {
-                    lastAmplitudeReportTimeMs = now
-                    // 计算当前写入数据块的振幅
-                    val amplitude = calculateAmplitude(bytes, offset - written, written)
-                    listener?.onAmplitudeUpdate(amplitude)
-                }
+                updatePlayedBytesFromAudioTrack()
             } else {
                 // write 返回 0 或负值时短暂休眠避免死循环
                 Thread.sleep(5)
             }
         }
-    }
-    
-    /**
-     * 计算音频数据的 RMS 振幅
-     * 
-     * @param bytes PCM 16-bit 字节数组
-     * @param offset 起始偏移
-     * @param length 要计算的字节数
-     * @return 振幅值（0.0 ~ 1.0）
-     */
-    private fun calculateAmplitude(bytes: ByteArray, offset: Int, length: Int): Double {
-        if (length < 2) return 0.0
-        
-        var sum = 0.0
-        var count = 0
-        
-        // PCM 16-bit little-endian 格式，每两个字节组成一个样本
-        var i = offset
-        while (i < offset + length - 1) {
-            // 读取 16-bit 样本（小端序）
-            val sample = ((bytes[i + 1].toInt() shl 8) or (bytes[i].toInt() and 0xFF)).toShort()
-            // 归一化到 -1.0 ~ 1.0
-            val normalized = sample.toDouble() / Short.MAX_VALUE
-            // 累加平方
-            sum += normalized * normalized
-            count++
-            i += 2
-        }
-        
-        if (count == 0) return 0.0
-        
-        // 计算 RMS（均方根）
-        val rms = kotlin.math.sqrt(sum / count)
-        
-        // 放大映射到嘴巴开合范围，类似 Web 版的 rms * 8
-        // 限制在 0.0 ~ 1.0 范围
-        return (rms * 8.0).coerceIn(0.0, 1.0)
     }
 
     /**
@@ -450,9 +546,12 @@ class PCMStreamPlayer(
     fun pause() {
         if (!isPlaying) return
         if (currentState != PlaybackState.PLAYING) return
-        
+
         currentState = PlaybackState.PAUSED
         audioTrack?.pause()
+        amplitudeJob?.cancel()
+        amplitudeJob = null
+        listener?.onAmplitudeUpdate(0.0)
         listener?.onPlaybackPaused()
         android.util.Log.d("PCMStreamPlayer", "⏸️ 播放暂停")
     }
@@ -463,35 +562,40 @@ class PCMStreamPlayer(
      */
     fun stopAndReset() {
         if (currentState == PlaybackState.IDLE) return
-        
+
         isPlaying = false
         currentState = PlaybackState.IDLE
         lastAppendTimeMs = 0L
-        
+
         // ===== 重置播放时间统计 =====
         val finalPlayedDuration = getPlayedDuration()
         val finalTotalDuration = getTotalDuration()
-        android.util.Log.d("PCMStreamPlayer", 
+        android.util.Log.d("PCMStreamPlayer",
             "⏹️ 播放停止 - 最终统计: 播放 %.2f / %.2f 秒".format(
                 finalPlayedDuration, finalTotalDuration))
-        
+
         totalBytesAppended = 0L
         totalBytesPlayed = 0L
         totalBytesWritten = 0L
         lastProgressReportTimeMs = 0L
-        
+        clearAmplitudeHistory()
+
+        amplitudeJob?.cancel()
+        amplitudeJob = null
         playbackJob?.cancel()
         playbackJob = null
-        
+
         audioTrack?.pause()
-        
+        try { audioTrack?.flush() } catch (_: Throwable) {}
+        listener?.onAmplitudeUpdate(0.0)
+
         // 清空 channel（无阻塞清空）
         scope.launch {
             while (!bufferChannel.isEmpty) {
                 bufferChannel.tryReceive().getOrNull()
             }
         }
-        
+
         android.util.Log.d("PCMStreamPlayer", "⏹️ 播放已停止并重置")
     }
 
@@ -501,36 +605,39 @@ class PCMStreamPlayer(
      */
     fun release() {
         android.util.Log.d("PCMStreamPlayer", "🗑️ 释放播放器资源")
-        
+
         isPlaying = false
         currentState = PlaybackState.IDLE
         lastAppendTimeMs = 0L
-        
+
         // ===== 重置播放时间统计 =====
         totalBytesAppended = 0L
         totalBytesPlayed = 0L
         totalBytesWritten = 0L
         lastProgressReportTimeMs = 0L
-        
+        clearAmplitudeHistory()
+
+        amplitudeJob?.cancel()
+        amplitudeJob = null
         playbackJob?.cancel()
         playbackJob = null
-        
+
         scope.cancel()
-        
+
         audioTrack?.stop()
         audioTrack?.release()
         audioTrack = null
-        
+
         // 关闭 channel
         bufferChannel.close()
-        
+
         listener = null
     }
 
     companion object {
         /**
          * 将 float 数组 [-1f,1f] 转换为 PCM16 字节数组（little-endian）
-         * 
+         *
          * @param floatData 浮点音频数据，范围 [-1.0, 1.0]
          * @return PCM 16-bit 字节数组
          */
@@ -544,4 +651,3 @@ class PCMStreamPlayer(
         }
     }
 }
-
